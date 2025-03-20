@@ -11,9 +11,11 @@ API_ID = 'YOUR_API_ID'
 API_HASH = 'YOUR_API_HASH'
 PHONE_NUMBER = 'YOUR_PHONE_NUMBER'  # With country code, e.g. '+1234567890'
 
-# Channels configuration
-SOURCE_CHANNELS: List[str] = ['channel_username1', 'channel_username2']  # Source channel usernames
-FORWARD_CHANNEL_ID: int = 0  # Target channel ID to forward messages to
+# Source and target configuration
+# Each source can be a channel username, group username, or chat ID
+SOURCE_CHATS: List[str] = ['channel_username1', 'group_username2']  # Source chat identifiers
+# Target chat ID to forward messages to (can be a channel, group, or private chat)
+FORWARD_CHAT_ID: int = 0
 
 # File paths for persistent storage
 SESSION_NAME: str = 'session_name'  # Name for the Telethon session file

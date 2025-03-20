@@ -1,10 +1,12 @@
 """
 Telegram client functionality for the Telegram Auto Forwarder.
+Supports both channels and groups.
 """
 import asyncio
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Union, Any
 from telethon import TelegramClient, functions, types
 from telethon.tl.patched import Message
+from telethon.tl.types import Channel, Chat, User, InputChannel, InputPeerChannel, InputPeerChat, InputPeerUser
 from telethon.errors import FloodWaitError
 
 from logger import logger
@@ -34,6 +36,9 @@ class TelegramForwarder:
         # Dictionary to store grouped messages until all are received
         self.grouped_messages: Dict[int, List[Tuple[Message, str]]] = {}
         self.processing_groups: Set[int] = set()
+        
+        # Store chat entities to avoid repeated lookups
+        self.chat_entities: Dict[int, Any] = {}
     
     async def start(self, phone: str) -> None:
         """
@@ -50,55 +55,90 @@ class TelegramForwarder:
         await self.client.disconnect()
         logger.info("Telegram client stopped")
     
-    async def fetch_channel_entity(self, username: str) -> Optional[types.Channel]:
+    async def fetch_chat_entity(self, identifier: Union[str, int]) -> Optional[Union[Channel, Chat, User]]:
         """
-        Fetch a channel entity by username.
+        Fetch a chat entity by username or ID.
         
         Args:
-            username: Channel username
+            identifier: Chat username or ID
             
         Returns:
-            Channel entity or None if not found
+            Chat entity or None if not found
         """
         try:
-            return await self.client.get_entity(username)
+            entity = await self.client.get_entity(identifier)
+            # Cache the entity
+            self.chat_entities[entity.id] = entity
+            return entity
         except Exception as e:
-            logger.error(f"Failed to get entity for {username}: {e}")
+            logger.error(f"Failed to get entity for {identifier}: {e}")
             return None
     
-    async def initialize_channel(self, channel) -> None:
+    async def initialize_chat(self, chat_entity: Union[Channel, Chat, User]) -> None:
         """
-        Initialize a channel's state if not already initialized.
+        Initialize a chat's state if not already initialized.
         
         Args:
-            channel: Channel entity
+            chat_entity: Chat entity
         """
-        # If we already have state for this channel, use it
-        if self.state_manager.get_channel_pts(channel.id) is not None:
-            logger.info(f"Using saved state for channel {channel.id} with pts {self.state_manager.get_channel_pts(channel.id)}")
+        chat_id = chat_entity.id
+        chat_type = self.state_manager.determine_chat_type(chat_entity)
+        
+        # If we already have state for this chat, use it
+        if self.state_manager.get_chat_type(chat_id) is not None:
+            logger.info(f"Using saved state for {chat_type} {chat_id}")
             return
             
-        # Otherwise initialize with the proper pts using GetChannelRequest
-        try:
-            full_channel = await self.client(functions.channels.GetFullChannelRequest(
-                channel=channel
-            ))
-            
-            # Initialize with the proper pts from the full channel info
-            pts = full_channel.full_chat.pts
-            self.state_manager.initialize_channel(channel.id, pts)
-        except Exception as e:
-            logger.error(f"Failed to initialize channel {channel.id}: {e}")
+        # Initialize with appropriate state data based on chat type
+        if chat_type == 'channel':
+            # For channels, we need the PTS value
+            try:
+                full_channel = await self.client(functions.channels.GetFullChannelRequest(
+                    channel=chat_entity
+                ))
+                pts = full_channel.full_chat.pts
+                self.state_manager.initialize_chat(chat_id, chat_type, {'pts': pts})
+            except Exception as e:
+                logger.error(f"Failed to initialize channel {chat_id}: {e}")
+        elif chat_type == 'group':
+            # For groups, we'll track the last message ID
+            try:
+                # Get the most recent message to start tracking from
+                messages = await self.client.get_messages(chat_entity, limit=1)
+                last_id = messages[0].id if messages else 0
+                self.state_manager.initialize_chat(chat_id, chat_type, {'last_id': last_id})
+            except Exception as e:
+                logger.error(f"Failed to initialize group {chat_id}: {e}")
+        else:
+            # For other chat types, just initialize with empty state
+            self.state_manager.initialize_chat(chat_id, chat_type, {})
     
-    async def fetch_channel_difference(self, channel) -> None:
+    async def fetch_new_messages(self, chat_entity: Union[Channel, Chat, User]) -> None:
         """
-        Fetch new messages from a channel.
+        Fetch new messages from a chat.
+        
+        Args:
+            chat_entity: Chat entity
+        """
+        chat_id = chat_entity.id
+        chat_type = self.state_manager.get_chat_type(chat_id)
+        
+        if chat_type == 'channel':
+            await self._fetch_channel_difference(chat_entity)
+        elif chat_type == 'group':
+            await self._fetch_group_messages(chat_entity)
+        else:
+            logger.warning(f"Unsupported chat type: {chat_type} for chat {chat_id}")
+    
+    async def _fetch_channel_difference(self, channel: Channel) -> None:
+        """
+        Fetch new messages from a channel using GetChannelDifferenceRequest.
         
         Args:
             channel: Channel entity
         """
         try:
-            pts = self.state_manager.get_channel_pts(channel.id)
+            pts = self.state_manager.get_chat_state(channel.id, 'pts')
             if pts is None:
                 logger.error(f"No PTS found for channel {channel.id}")
                 return
@@ -118,7 +158,7 @@ class TelegramForwarder:
                     await self.process_new_message(channel, message)
 
             # Update the state variables - pts should be available in all response types
-            self.state_manager.update_channel_pts(channel.id, result.pts)
+            self.state_manager.update_chat_state(channel.id, {'pts': result.pts})
             
         except FloodWaitError as e:
             logger.warning(f"Rate limited. Waiting for {e.seconds} seconds.")
@@ -126,12 +166,46 @@ class TelegramForwarder:
         except Exception as e:
             logger.error(f"An error occurred while fetching updates from channel {channel.id}: {e}")
     
-    async def process_new_message(self, channel, message: Message) -> None:
+    async def _fetch_group_messages(self, group: Union[Chat, Channel]) -> None:
         """
-        Process a new message from a channel.
+        Fetch new messages from a group using get_messages.
         
         Args:
-            channel: Source channel entity
+            group: Group entity (can be a regular group or a supergroup)
+        """
+        try:
+            last_id = self.state_manager.get_chat_state(group.id, 'last_id') or 0
+            
+            # Get messages newer than the last processed ID
+            messages = await self.client.get_messages(
+                group,
+                limit=100,  # Adjust as needed
+                min_id=last_id
+            )
+            
+            if not messages:
+                return
+                
+            # Process messages in chronological order (oldest first)
+            for message in reversed(messages):
+                await self.process_new_message(group, message)
+                
+            # Update the last message ID
+            new_last_id = max(msg.id for msg in messages)
+            self.state_manager.update_chat_state(group.id, {'last_id': new_last_id})
+            
+        except FloodWaitError as e:
+            logger.warning(f"Rate limited. Waiting for {e.seconds} seconds.")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"An error occurred while fetching messages from group {group.id}: {e}")
+    
+    async def process_new_message(self, chat_entity: Union[Channel, Chat, User], message: Message) -> None:
+        """
+        Process a new message from a chat.
+        
+        Args:
+            chat_entity: Source chat entity
             message: Message to process
         """
         try:
@@ -155,27 +229,30 @@ class TelegramForwarder:
                 # Start a task to process this group after a delay (to collect all messages)
                 if group_id not in self.processing_groups:
                     self.processing_groups.add(group_id)
-                    asyncio.create_task(self.process_group_after_delay(channel, group_id))
+                    asyncio.create_task(self.process_group_after_delay(chat_entity, group_id))
             else:
                 # Regular non-grouped message
                 message_content = message.message or ""
                 if self.ai_filter.is_content_interesting(message_content):
-                    forward_channel_entity = await self.client.get_entity(config.FORWARD_CHANNEL_ID)
-                    await self.client.forward_messages(forward_channel_entity, message, channel)
-                    # Add hash to store after successful forwarding
-                    self.state_manager.add_hash_to_store(message_hash)
-                    logger.info(f"Forwarded regular message {message.id} to {forward_channel_entity.title}")
+                    forward_chat_entity = await self.fetch_chat_entity(config.FORWARD_CHAT_ID)
+                    if forward_chat_entity:
+                        await self.client.forward_messages(forward_chat_entity, message, chat_entity)
+                        # Add hash to store after successful forwarding
+                        self.state_manager.add_hash_to_store(message_hash)
+                        logger.info(f"Forwarded message {message.id} from {chat_entity.id} to {forward_chat_entity.id}")
+                    else:
+                        logger.error(f"Could not find forward chat with ID {config.FORWARD_CHAT_ID}")
                 else:
                     logger.info(f"Message {message.id} filtered out as not interesting")
         except Exception as e:
             logger.error(f"Failed to process message {message.id}: {e}")
     
-    async def process_group_after_delay(self, channel, group_id: int, delay_seconds: int = None) -> None:
+    async def process_group_after_delay(self, chat_entity: Union[Channel, Chat, User], group_id: int, delay_seconds: int = None) -> None:
         """
         Process a group of messages after collecting them for a short time.
         
         Args:
-            channel: Source channel entity
+            chat_entity: Source chat entity
             group_id: Group ID of the messages
             delay_seconds: Delay in seconds before processing (defaults to config value)
         """
@@ -206,12 +283,15 @@ class TelegramForwarder:
             group_already_processed = any(self.state_manager.is_hash_in_store(msg_hash) for _, msg_hash in message_tuples)
             
             if not group_already_processed and self.ai_filter.is_content_interesting(messages_content):
-                forward_channel_entity = await self.client.get_entity(config.FORWARD_CHANNEL_ID)
-                for message, message_hash in message_tuples:
-                    await self.client.forward_messages(forward_channel_entity, message, channel)
-                    # Add hash to store after successful forwarding
-                    self.state_manager.add_hash_to_store(message_hash)
-                    logger.info(f"Forwarded grouped message {message.id} to {forward_channel_entity.title}")
+                forward_chat_entity = await self.fetch_chat_entity(config.FORWARD_CHAT_ID)
+                if forward_chat_entity:
+                    for message, message_hash in message_tuples:
+                        await self.client.forward_messages(forward_chat_entity, message, chat_entity)
+                        # Add hash to store after successful forwarding
+                        self.state_manager.add_hash_to_store(message_hash)
+                        logger.info(f"Forwarded grouped message {message.id} to {forward_chat_entity.id}")
+                else:
+                    logger.error(f"Could not find forward chat with ID {config.FORWARD_CHAT_ID}")
             elif group_already_processed:
                 logger.debug(f"Media group {group_id} already processed (hash in store). Skipping.")
             else:

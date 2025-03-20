@@ -1,13 +1,15 @@
 """
 Telegram Auto Forwarder - Main entry point.
 
-This script monitors specified Telegram channels for new messages,
-filters them using AI, and forwards interesting messages to a target channel.
+This script monitors specified Telegram channels and groups for new messages,
+filters them using AI, and forwards interesting messages to a target chat.
 """
 import asyncio
 import signal
 import sys
-from typing import List
+from typing import List, Union
+
+from telethon.tl.types import Channel, Chat, User
 
 from logger import logger, setup_logger
 import config
@@ -38,26 +40,39 @@ async def run_forwarder():
                 lambda: asyncio.create_task(shutdown(forwarder, state_manager))
             )
         
-        # Initialize channels
-        source_channels = []
-        for username in config.SOURCE_CHANNELS:
-            channel = await forwarder.fetch_channel_entity(username)
-            if channel:
-                await forwarder.initialize_channel(channel)
-                source_channels.append(channel)
+        # Initialize source chats
+        source_entities = []
+        for identifier in config.SOURCE_CHATS:
+            chat_entity = await forwarder.fetch_chat_entity(identifier)
+            if chat_entity:
+                await forwarder.initialize_chat(chat_entity)
+                source_entities.append(chat_entity)
+                chat_type = state_manager.determine_chat_type(chat_entity)
+                logger.info(f"Initialized {chat_type} {chat_entity.id} ({getattr(chat_entity, 'title', 'No Title')})")
             else:
-                logger.error(f"Could not find channel: {username}")
+                logger.error(f"Could not find chat: {identifier}")
         
-        if not source_channels:
-            logger.error("No valid source channels found. Exiting.")
+        if not source_entities:
+            logger.error("No valid source chats found. Exiting.")
             return
+            
+        # Initialize forward chat (just make sure it exists)
+        forward_entity = await forwarder.fetch_chat_entity(config.FORWARD_CHAT_ID)
+        if not forward_entity:
+            logger.error(f"Could not find forward chat with ID {config.FORWARD_CHAT_ID}. Exiting.")
+            return
+            
+        forward_chat_type = state_manager.determine_chat_type(forward_entity)
+        logger.info(f"Using {forward_chat_type} {forward_entity.id} ({getattr(forward_entity, 'title', 'No Title')}) as forward destination")
         
-        logger.info(f"Monitoring new messages in channels: {', '.join(config.SOURCE_CHANNELS)}...")
+        # Log what we're monitoring
+        chat_names = [getattr(entity, 'title', str(entity.id)) for entity in source_entities]
+        logger.info(f"Monitoring new messages in: {', '.join(chat_names)}...")
         
         # Main polling loop
         while True:
-            for channel in source_channels:
-                await forwarder.fetch_channel_difference(channel)
+            for chat_entity in source_entities:
+                await forwarder.fetch_new_messages(chat_entity)
             # Wait for a specified interval before polling again
             await asyncio.sleep(config.POLLING_INTERVAL)
             
@@ -79,10 +94,10 @@ async def shutdown(forwarder: TelegramForwarder, state_manager: StateManager):
     logger.info("Shutting down...")
     try:
         # Save states one more time on clean exit
-        state_manager.save_channel_states()
+        state_manager.save_chat_states()
         state_manager.save_message_hash_store()
         await forwarder.stop()
-        logger.info("Bot stopped. Channel states and message hashes saved.")
+        logger.info("Bot stopped. Chat states and message hashes saved.")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
     finally:
