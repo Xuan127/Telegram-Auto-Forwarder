@@ -1,0 +1,3 @@
+- Change prompts
+- How to make sure there are not false negatives (not forwarding things i might want)
+- Deploy
