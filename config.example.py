@@ -12,10 +12,17 @@ API_HASH = 'YOUR_API_HASH'
 PHONE_NUMBER = 'YOUR_PHONE_NUMBER'  # With country code, e.g. '+1234567890'
 
 # Source and target configuration
-# Each source can be a channel username, group username, or chat ID
-SOURCE_CHATS: List[str] = ['channel_username1', 'group_username2']  # Source chat identifiers
+# For channels and groups, you can specify them in several ways:
+SOURCE_CHATS: List[str] = [
+    'channel_username',         # Public channel by username (without @)
+    'group_username',           # Public group by username (without @)
+    '-1001234567890',           # Group/channel by ID (usually negative for groups)
+    'https://t.me/joinchat/abc', # Private group by invite link
+]
+
 # Target chat ID to forward messages to (can be a channel, group, or private chat)
-FORWARD_CHAT_ID: int = 0
+# Run list_chats.py to get IDs for all your chats
+FORWARD_CHAT_ID: int = 0  # Replace with your forward destination ID
 
 # File paths for persistent storage
 SESSION_NAME: str = 'session_name'  # Name for the Telethon session file
